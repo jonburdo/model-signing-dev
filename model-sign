@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""
+Model signing CLI tool for private TAS infrastructure.
+
+A single-file CLI tool that handles ML model signing and verification
+with private Trusted Artifact Signer (TAS) infrastructure.
+
+Commands:
+  initialize  Download and cache trust configuration from TAS
+  sign        Sign a model directory
+  verify      Verify a signed model
+
+Usage:
+  model-sign initialize --tuf-url=$TUF_URL
+  model-sign sign MODEL_PATH
+  model-sign verify MODEL_PATH
+"""
+
+import os
+import sys
+import json
+import tempfile
+import argparse
+from pathlib import Path
+from typing import Optional
+import requests
+
+# Cache directory for trust configuration (same as cosign)
+CACHE_DIR = Path.home() / ".sigstore"
+TRUST_ROOT_CACHE = CACHE_DIR / "root" / "targets" / "trusted_root.json"
+TRUST_CONFIG_CACHE = CACHE_DIR / "trust_config.json"
+
+
+# =============================================================================
+# Trust Configuration Management
+# =============================================================================
+
+
+def transform_checkpoint_to_logid(obj):
+    """Transform checkpointKeyId to logId recursively (TUF v0.1 → v0.2)."""
+    if isinstance(obj, dict):
+        if "checkpointKeyId" in obj:
+            obj["logId"] = obj.pop("checkpointKeyId")
+        for key, value in obj.items():
+            obj[key] = transform_checkpoint_to_logid(value)
+    elif isinstance(obj, list):
+        return [transform_checkpoint_to_logid(item) for item in obj]
+    return obj
+
+
+def fix_trusted_root_urls(trusted_root_data, fulcio_url, rekor_url, tsa_url):
+    """Fix internal Kubernetes URLs to actual external routes."""
+    # Fix Certificate Authorities (Fulcio)
+    for ca in trusted_root_data.get("certificateAuthorities", []):
+        if ca.get("uri") and ("fulcio" in ca["uri"].lower() or ".rhtas" in ca["uri"]):
+            ca["uri"] = fulcio_url
+
+    # Fix TLogs (Rekor)
+    for tlog in trusted_root_data.get("tlogs", []):
+        if tlog.get("baseUrl") and (
+            "rekor" in tlog["baseUrl"].lower() or ".rhtas" in tlog["baseUrl"]
+        ):
+            tlog["baseUrl"] = rekor_url
+
+    # Fix Timestamp Authorities (TSA)
+    if tsa_url:
+        for tsa in trusted_root_data.get("timestampAuthorities", []):
+            if tsa.get("uri") and (
+                "tsa" in tsa["uri"].lower() or ".rhtas" in tsa["uri"]
+            ):
+                tsa["uri"] = tsa_url
+
+    return trusted_root_data
+
+
+def download_trusted_root(tuf_url: str) -> dict:
+    """Download trusted_root.json from TAS TUF server via HTTP."""
+    print(f"Downloading trusted root from TUF: {tuf_url}")
+
+    try:
+        # Get targets metadata to find digest
+        targets_response = requests.get(f"{tuf_url}/1.targets.json", timeout=30)
+        targets_response.raise_for_status()
+        targets_data = targets_response.json()
+
+        # Find trusted_root.json digest
+        signed_targets = targets_data.get("signed", {}).get("targets", {})
+
+        if "trusted_root.json" in signed_targets:
+            sha256_hash = signed_targets["trusted_root.json"]["hashes"]["sha256"]
+            print(f"  Found digest: {sha256_hash[:16]}...")
+
+            # Download with digest prefix
+            tr_url = f"{tuf_url}/targets/{sha256_hash}.trusted_root.json"
+            tr_response = requests.get(tr_url, timeout=30)
+            tr_response.raise_for_status()
+            return tr_response.json()
+        else:
+            raise ValueError("trusted_root.json not found in targets metadata")
+
+    except Exception as e:
+        print(f"  Error: {e}")
+        print("  Trying fallback paths...")
+
+        for path in ["targets/trusted_root.json", "trusted_root.json"]:
+            try:
+                tr_url = f"{tuf_url}/{path}"
+                tr_response = requests.get(tr_url, timeout=30)
+                tr_response.raise_for_status()
+                print(f"  Success with: {path}")
+                return tr_response.json()
+            except:
+                continue
+
+        raise RuntimeError(f"Could not download trusted_root.json from {tuf_url}")
+
+
+def create_trust_config(
+    tuf_url: str,
+    fulcio_url: str,
+    rekor_url: str,
+    oidc_issuer: str,
+    tsa_url: Optional[str] = None,
+) -> dict:
+    """Create a complete ClientTrustConfig from TAS infrastructure."""
+    # Download trusted root
+    trusted_root = download_trusted_root(tuf_url)
+
+    # Transform checkpointKeyId → logId
+    print("  Transforming checkpointKeyId → logId...")
+    trusted_root = transform_checkpoint_to_logid(trusted_root)
+
+    # Fix internal URLs to external routes
+    print("  Fixing internal URLs to external routes...")
+    trusted_root = fix_trusted_root_urls(trusted_root, fulcio_url, rekor_url, tsa_url)
+
+    # Build TSA URL
+    tsa_url_full = None
+    if tsa_url:
+        tsa_url_full = tsa_url.rstrip("/") + "/api/v1/timestamp"
+
+    # Create complete trust config
+    trust_config = {
+        "mediaType": "application/vnd.dev.sigstore.clienttrustconfig.v0.1+json",
+        "trustedRoot": trusted_root,
+        "signingConfig": {
+            "mediaType": "application/vnd.dev.sigstore.signingconfig.v0.2+json",
+            "caUrls": [
+                {
+                    "url": fulcio_url,
+                    "majorApiVersion": 1,
+                    "validFor": {"start": "2023-04-14T21:38:40Z"},
+                    "operator": "sigstore.dev",
+                }
+            ],
+            "oidcUrls": [
+                {
+                    "url": oidc_issuer,
+                    "majorApiVersion": 1,
+                    "validFor": {"start": "2025-04-16T00:00:00Z"},
+                    "operator": "sigstore.dev",
+                }
+            ],
+            "rekorTlogUrls": [
+                {
+                    "url": rekor_url,
+                    "majorApiVersion": 1,
+                    "validFor": {"start": "2021-01-12T11:53:27Z"},
+                    "operator": "sigstore.dev",
+                }
+            ],
+            "tsaUrls": [
+                {
+                    "url": tsa_url_full,
+                    "majorApiVersion": 1,
+                    "validFor": {"start": "2025-04-09T00:00:00Z"},
+                    "operator": "sigstore.dev",
+                }
+            ]
+            if tsa_url_full
+            else [],
+            "rekorTlogConfig": {"selector": "ANY"},
+            "tsaConfig": {"selector": "ANY"},
+        },
+    }
+
+    return trust_config
+
+
+# =============================================================================
+# Signing Functions
+# =============================================================================
+
+
+def create_manifest(model_path: Path):
+    """Create a manifest from the model directory."""
+    from model_signing._hashing import io as hashing_io
+    from model_signing._hashing import memory
+    from model_signing import manifest
+
+    print(f"Creating manifest for {model_path.name}...")
+
+    items = []
+    for file_path in sorted(model_path.rglob("*")):
+        if file_path.is_file() and not file_path.name.endswith(".sig"):
+            file_hasher = hashing_io.SimpleFileHasher(
+                file_path, content_hasher=memory.SHA256()
+            )
+            file_digest = file_hasher.compute()
+            relative_path = file_path.relative_to(model_path)
+            item = manifest.FileManifestItem(
+                path=Path(relative_path), digest=file_digest
+            )
+            items.append(item)
+
+    serialization_type = manifest.SerializationType.from_args(
+        {
+            "method": "files",
+            "hash_type": "sha256",
+            "allow_symlinks": False,
+            "ignore_paths": [],
+        }
+    )
+
+    model_manifest = manifest.Manifest(
+        model_name=model_path.name, items=items, serialization_type=serialization_type
+    )
+
+    print(f"  Created manifest with {len(items)} files")
+    return model_manifest
+
+
+def sign_model(
+    model_path: Path, identity_token: str, oidc_issuer: str, trust_config: dict
+) -> Path:
+    """Sign a model using the trust configuration."""
+    from model_signing._signing.signing import Payload
+    from sigstore.models import ClientTrustConfig
+    from sigstore.sign import SigningContext
+    from sigstore import oidc as sigstore_oidc
+    from google.protobuf import json_format
+    from sigstore import dsse as sigstore_dsse
+
+    print(f"\nSigning model: {model_path}")
+
+    # Create manifest
+    model_manifest = create_manifest(model_path)
+
+    # Create signing payload
+    payload = Payload(model_manifest)
+
+    # Create trust config and signing context
+    print("Initializing signing context...")
+
+    # Save trust config to temp file
+    temp_file = Path(tempfile.mkdtemp()) / "trust_config.json"
+    temp_file.write_text(json.dumps(trust_config))
+
+    trust_config_obj = ClientTrustConfig.from_json(temp_file.read_text())
+    signing_ctx = SigningContext.from_trust_config(trust_config_obj)
+
+    # Create identity token (client_id must match token audience)
+    token = sigstore_oidc.IdentityToken(identity_token, client_id=oidc_issuer)
+
+    # Sign
+    print("Signing...")
+    with signing_ctx.signer(token) as signer:
+        statement = sigstore_dsse.Statement(
+            json_format.MessageToJson(payload.statement.pb).encode("utf-8")
+        )
+        bundle = signer.sign_dsse(statement)
+
+    # Save signature
+    signature_path = model_path / "model.sig"
+    signature_path.write_text(bundle.to_json(), encoding="utf-8")
+
+    # Cleanup
+    temp_file.unlink()
+    temp_file.parent.rmdir()
+
+    print(f"✅ Signed successfully: {signature_path}")
+    return signature_path
+
+
+def verify_model(
+    model_path: Path, oidc_issuer: str, expected_identity: str, trust_config: dict
+) -> bool:
+    """Verify a signed model using the trust configuration."""
+    from model_signing._signing.sign_sigstore import Signature as ModelSignature
+    from model_signing._signing.sign_sigstore import Verifier as ModelVerifier
+    from model_signing._hashing import io as hashing_io
+    from model_signing._hashing import memory
+
+    print(f"\nVerifying model: {model_path}")
+
+    signature_path = model_path / "model.sig"
+    if not signature_path.exists():
+        print(f"❌ Error: Signature not found at {signature_path}")
+        return False
+
+    # Save trust config to temp file
+    temp_file = Path(tempfile.mkdtemp()) / "trust_config.json"
+    temp_file.write_text(json.dumps(trust_config))
+
+    try:
+        # Load signature
+        print("Loading signature bundle...")
+        signature = ModelSignature.read(signature_path)
+
+        # Create verifier with identity policy
+        print("Creating verifier...")
+        print(f"  Expected identity: {expected_identity}")
+
+        verifier = ModelVerifier(
+            identity=expected_identity, oidc_issuer=oidc_issuer, trust_config=temp_file
+        )
+
+        # Verify signature
+        print("Verifying signature...")
+        model_manifest = verifier.verify(signature)
+
+        print("  ✅ Signature verified")
+        print(f"  ✅ Identity: {expected_identity}")
+        print(f"  ✅ Issuer: {oidc_issuer}")
+
+        # Verify file hashes
+        print("\nVerifying file hashes...")
+        resources = list(model_manifest.resource_descriptors())
+        verified_count = 0
+        failed_count = 0
+
+        for descriptor in resources:
+            file_path = model_path / descriptor.identifier
+
+            if not file_path.exists():
+                print(f"  ❌ Missing: {descriptor.identifier}")
+                failed_count += 1
+                continue
+
+            file_hasher = hashing_io.SimpleFileHasher(
+                file_path, content_hasher=memory.SHA256()
+            )
+            actual_digest = file_hasher.compute()
+
+            if actual_digest.digest_hex == descriptor.digest.digest_hex:
+                verified_count += 1
+            else:
+                print(f"  ❌ Hash mismatch: {descriptor.identifier}")
+                failed_count += 1
+
+        print(f"\n{'=' * 70}")
+        print(f"VERIFICATION RESULTS")
+        print(f"{'=' * 70}")
+        print(f"  ✅ Files verified: {verified_count}/{len(resources)}")
+
+        if failed_count > 0:
+            print(f"  ❌ Files failed: {failed_count}")
+            print(f"\n❌ VERIFICATION FAILED")
+            return False
+        else:
+            print(f"\n✅ VERIFICATION PASSED")
+            return True
+
+    finally:
+        # Cleanup
+        temp_file.unlink()
+        temp_file.parent.rmdir()
+
+
+# =============================================================================
+# CLI Commands
+# =============================================================================
+
+
+def cmd_initialize(args):
+    """Initialize trust configuration from TAS."""
+    print("=" * 70)
+    print("Initializing Model Signing Trust Configuration")
+    print("=" * 70)
+
+    # Get required environment variables
+    required_vars = ["FULCIO_URL", "REKOR_URL", "TUF_URL", "OIDC_ISSUER"]
+    missing = [v for v in required_vars if not os.getenv(v)]
+
+    if missing:
+        print(f"\n❌ Error: Missing environment variables: {', '.join(missing)}")
+        print("\nRequired environment variables:")
+        for var in required_vars:
+            print(f"  - {var}")
+        print("\nOptional:")
+        print(f"  - TSA_URL")
+        return 1
+
+    fulcio_url = os.getenv("FULCIO_URL")
+    rekor_url = os.getenv("REKOR_URL")
+    tuf_url = os.getenv("TUF_URL")
+    oidc_issuer = os.getenv("OIDC_ISSUER")
+    tsa_url = os.getenv("TSA_URL")
+
+    print(f"\nTUF URL: {tuf_url}")
+    print(f"Fulcio URL: {fulcio_url}")
+    print(f"Rekor URL: {rekor_url}")
+    if tsa_url:
+        print(f"TSA URL: {tsa_url}")
+    print()
+
+    try:
+        # Download trusted root
+        trusted_root = download_trusted_root(tuf_url)
+
+        # Transform and fix URLs
+        print("  Transforming checkpointKeyId → logId...")
+        trusted_root = transform_checkpoint_to_logid(trusted_root)
+
+        print("  Fixing internal URLs to external routes...")
+        trusted_root = fix_trusted_root_urls(
+            trusted_root, fulcio_url, rekor_url, tsa_url
+        )
+
+        # Cache transformed trusted_root.json (like cosign does)
+        TRUST_ROOT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        TRUST_ROOT_CACHE.write_text(json.dumps(trusted_root, indent=2))
+        print(f"\n✅ Cached trusted root to: {TRUST_ROOT_CACHE}")
+
+        # Create and cache complete trust configuration
+        tsa_url_full = None
+        if tsa_url:
+            tsa_url_full = tsa_url.rstrip("/") + "/api/v1/timestamp"
+
+        trust_config = {
+            "mediaType": "application/vnd.dev.sigstore.clienttrustconfig.v0.1+json",
+            "trustedRoot": trusted_root,
+            "signingConfig": {
+                "mediaType": "application/vnd.dev.sigstore.signingconfig.v0.2+json",
+                "caUrls": [
+                    {
+                        "url": fulcio_url,
+                        "majorApiVersion": 1,
+                        "validFor": {"start": "2023-04-14T21:38:40Z"},
+                        "operator": "sigstore.dev",
+                    }
+                ],
+                "oidcUrls": [
+                    {
+                        "url": oidc_issuer,
+                        "majorApiVersion": 1,
+                        "validFor": {"start": "2025-04-16T00:00:00Z"},
+                        "operator": "sigstore.dev",
+                    }
+                ],
+                "rekorTlogUrls": [
+                    {
+                        "url": rekor_url,
+                        "majorApiVersion": 1,
+                        "validFor": {"start": "2021-01-12T11:53:27Z"},
+                        "operator": "sigstore.dev",
+                    }
+                ],
+                "tsaUrls": [
+                    {
+                        "url": tsa_url_full,
+                        "majorApiVersion": 1,
+                        "validFor": {"start": "2025-04-09T00:00:00Z"},
+                        "operator": "sigstore.dev",
+                    }
+                ]
+                if tsa_url_full
+                else [],
+                "rekorTlogConfig": {"selector": "ANY"},
+                "tsaConfig": {"selector": "ANY"},
+            },
+        }
+
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        TRUST_CONFIG_CACHE.write_text(json.dumps(trust_config, indent=2))
+        print(f"✅ Cached trust config to: {TRUST_CONFIG_CACHE}")
+
+        print(f"\n✅ Initialization complete!")
+        print(f"\nYou can now run:")
+        print(f"  model-sign sign MODEL_PATH")
+        print(f"  model-sign verify MODEL_PATH")
+        return 0
+
+    except Exception as e:
+        print(f"\n❌ Initialization failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return 1
+
+
+def ensure_initialized(auto_init: bool = True) -> Optional[dict]:
+    """
+    Ensure trust configuration is initialized.
+
+    Args:
+        auto_init: If True, auto-initialize if not already done
+
+    Returns:
+        Trust config dict, or None if not initialized
+    """
+    if TRUST_CONFIG_CACHE.exists():
+        print(f"Using cached trust config: {TRUST_CONFIG_CACHE}")
+        return json.loads(TRUST_CONFIG_CACHE.read_text())
+
+    if not auto_init:
+        return None
+
+    print("Trust configuration not initialized.")
+    print("Auto-initializing from environment variables...")
+    print()
+
+    # Try to auto-initialize
+    class Args:
+        pass
+
+    args = Args()
+
+    result = cmd_initialize(args)
+    if result != 0:
+        return None
+
+    # Load the newly created config
+    if TRUST_CONFIG_CACHE.exists():
+        return json.loads(TRUST_CONFIG_CACHE.read_text())
+
+    return None
+
+
+def cmd_sign(args):
+    """Sign a model directory."""
+    print("=" * 70)
+    print("Model Signing")
+    print("=" * 70)
+
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        print(f"❌ Error: Model path not found: {model_path}")
+        return 1
+
+    if not model_path.is_dir():
+        print(f"❌ Error: Model path must be a directory: {model_path}")
+        return 1
+
+    # Ensure initialized
+    trust_config = ensure_initialized(auto_init=True)
+    if not trust_config:
+        print("\n❌ Error: Could not initialize trust configuration")
+        print("Please run: model-sign initialize")
+        return 1
+
+    # Get identity token
+    identity_token = os.getenv("IDENTITY_TOKEN")
+    if not identity_token:
+        # Try default Kubernetes service account token location
+        token_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+        if token_path.exists():
+            identity_token = token_path.read_text()
+        else:
+            print("❌ Error: IDENTITY_TOKEN not set")
+            print("Please export IDENTITY_TOKEN or run in a Kubernetes pod")
+            return 1
+
+    # Get OIDC issuer
+    oidc_issuer = os.getenv("OIDC_ISSUER")
+    if not oidc_issuer:
+        print("❌ Error: OIDC_ISSUER not set")
+        return 1
+
+    print(f"\nModel path: {model_path}")
+    print()
+
+    try:
+        signature_path = sign_model(
+            model_path, identity_token, oidc_issuer, trust_config
+        )
+        print(f"\n✅ Success!")
+        print(f"   Model: {model_path}")
+        print(f"   Signature: {signature_path}")
+        return 0
+
+    except Exception as e:
+        print(f"\n❌ Signing failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return 1
+
+
+def cmd_verify(args):
+    """Verify a signed model."""
+    print("=" * 70)
+    print("Model Verification")
+    print("=" * 70)
+
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        print(f"❌ Error: Model path not found: {model_path}")
+        return 1
+
+    signature_path = model_path / "model.sig"
+    if not signature_path.exists():
+        print(f"❌ Error: Signature not found: {signature_path}")
+        return 1
+
+    # Ensure initialized
+    trust_config = ensure_initialized(auto_init=True)
+    if not trust_config:
+        print("\n❌ Error: Could not initialize trust configuration")
+        print("Please run: model-sign initialize")
+        return 1
+
+    # Get OIDC issuer
+    oidc_issuer = os.getenv("OIDC_ISSUER")
+    if not oidc_issuer:
+        print("❌ Error: OIDC_ISSUER not set")
+        return 1
+
+    # Expected identity (can be overridden)
+    expected_identity = args.identity or os.getenv(
+        "EXPECTED_IDENTITY",
+        "https://kubernetes.io/namespaces/trusted-artifact-signer/serviceaccounts/default",
+    )
+
+    print(f"\nModel path: {model_path}")
+    print()
+
+    try:
+        success = verify_model(model_path, oidc_issuer, expected_identity, trust_config)
+        return 0 if success else 1
+
+    except Exception as e:
+        print(f"\n❌ Verification failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return 1
+
+
+def cmd_status(args):
+    """Show initialization status."""
+    print("=" * 70)
+    print("Model Signing Status")
+    print("=" * 70)
+
+    print(f"\nCache directory: {CACHE_DIR}")
+    print(f"Trusted root: {TRUST_ROOT_CACHE}")
+    print(f"Trust config: {TRUST_CONFIG_CACHE}")
+
+    if TRUST_CONFIG_CACHE.exists() and TRUST_ROOT_CACHE.exists():
+        print(f"\n✅ Initialized")
+
+        try:
+            trust_config = json.loads(TRUST_CONFIG_CACHE.read_text())
+            trusted_root = trust_config.get("trustedRoot", {})
+            signing_config = trust_config.get("signingConfig", {})
+
+            print(f"\nTrust configuration:")
+            print(f"  Media type: {trust_config.get('mediaType')}")
+            print(f"\nTrusted root:")
+            print(
+                f"  Certificate Authorities: {len(trusted_root.get('certificateAuthorities', []))}"
+            )
+            print(f"  Transparency Logs: {len(trusted_root.get('tlogs', []))}")
+            print(
+                f"  Timestamp Authorities: {len(trusted_root.get('timestampAuthorities', []))}"
+            )
+
+            print(f"\nService URLs:")
+            for ca_url in signing_config.get("caUrls", []):
+                print(f"  Fulcio: {ca_url.get('url')}")
+            for rekor_url in signing_config.get("rekorTlogUrls", []):
+                print(f"  Rekor: {rekor_url.get('url')}")
+            for tsa_url in signing_config.get("tsaUrls", []):
+                print(f"  TSA: {tsa_url.get('url')}")
+            for oidc_url in signing_config.get("oidcUrls", []):
+                print(f"  OIDC: {oidc_url.get('url')}")
+
+        except Exception as e:
+            print(f"  ⚠️  Warning: Could not parse config: {e}")
+    else:
+        print(f"\n❌ Not initialized")
+        print(f"\nRun: model-sign initialize")
+
+    return 0
+
+
+# =============================================================================
+# Main CLI
+# =============================================================================
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Model signing CLI for private TAS infrastructure",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Initialize (download and cache trust config)
+  export FULCIO_URL=https://fulcio-server-...
+  export REKOR_URL=https://rekor-server-...
+  export TUF_URL=https://tuf-...
+  export TSA_URL=https://tsa-server-...
+  export OIDC_ISSUER=https://rh-oidc.s3...
+  model-sign initialize
+
+  # Sign a model
+  export IDENTITY_TOKEN=$(oc create token default -n trusted-artifact-signer)
+  model-sign sign bert-base-uncased/
+
+  # Verify a model
+  model-sign verify bert-base-uncased/
+
+  # Check status
+  model-sign status
+        """,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # Initialize command
+    parser_init = subparsers.add_parser(
+        "initialize",
+        aliases=["init"],
+        help="Download and cache trust configuration from TAS",
+    )
+
+    # Sign command
+    parser_sign = subparsers.add_parser("sign", help="Sign a model directory")
+    parser_sign.add_argument("model_path", help="Path to model directory to sign")
+
+    # Verify command
+    parser_verify = subparsers.add_parser("verify", help="Verify a signed model")
+    parser_verify.add_argument("model_path", help="Path to signed model directory")
+    parser_verify.add_argument(
+        "--identity",
+        help="Expected identity (default: system:serviceaccount:trusted-artifact-signer:default)",
+        default=None,
+    )
+
+    # Status command
+    parser_status = subparsers.add_parser("status", help="Show initialization status")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    # Route to command handlers
+    if args.command in ["initialize", "init"]:
+        return cmd_initialize(args)
+    elif args.command == "sign":
+        return cmd_sign(args)
+    elif args.command == "verify":
+        return cmd_verify(args)
+    elif args.command == "status":
+        return cmd_status(args)
+    else:
+        parser.print_help()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
