@@ -1,0 +1,68 @@
+#!/bin/bash
+set -eu
+
+MODEL_DIR=~/models/fraud-detection
+
+rm -f "$MODEL_DIR"/model.sig
+
+IDENTITY_NAMESPACE=project2
+SERVICE_ACCOUNT=${SERVICE_ACCOUNT:-default}
+TAS_NAMESPACE=trusted-artifact-signer
+
+# Handle identity token
+if [[ -n "${IDENTITY_TOKEN_FILE:-}" ]]; then
+  echo "Using existing IDENTITY_TOKEN_FILE: $IDENTITY_TOKEN_FILE"
+elif [[ -n "${TOKEN:-}" ]]; then
+  IDENTITY_TOKEN_FILE=$(mktemp)
+  echo "$TOKEN" > "$IDENTITY_TOKEN_FILE"
+  echo "Using TOKEN and writing to IDENTITY_TOKEN_FILE: $IDENTITY_TOKEN_FILE"
+else
+  # No token provided, extract from running pod
+  IDENTITY_TOKEN_FILE=$(mktemp)
+  IDENTITY_NAMESPACE="$IDENTITY_NAMESPACE" ./tokens/get-token-from-pod.sh > "$IDENTITY_TOKEN_FILE"
+  echo "Extracted token from pod into IDENTITY_TOKEN_FILE: $IDENTITY_TOKEN_FILE"
+fi
+
+# Auto-detect service account from token if not explicitly set
+if [[ "${SERVICE_ACCOUNT}" == "default" ]]; then
+  DETECTED_SA=$(./tokens/detect-sa-from-token.sh "$IDENTITY_TOKEN_FILE" 2>/dev/null || echo "")
+  if [[ -n "$DETECTED_SA" ]]; then
+    SERVICE_ACCOUNT="$DETECTED_SA"
+    echo "Auto-detected SERVICE_ACCOUNT from token: $SERVICE_ACCOUNT"
+  fi
+fi
+
+# Extract OIDC issuer and client_id from token
+# Decode token payload once and extract both values
+TOKEN_PAYLOAD=$(cat "$IDENTITY_TOKEN_FILE" | cut -d'.' -f2)
+case $((${#TOKEN_PAYLOAD} % 4)) in
+  2) TOKEN_PAYLOAD="${TOKEN_PAYLOAD}==" ;;
+  3) TOKEN_PAYLOAD="${TOKEN_PAYLOAD}=" ;;
+esac
+TOKEN_CLAIMS=$(echo "$TOKEN_PAYLOAD" | base64 -d 2>/dev/null)
+export OIDC_ISSUER=$(echo "$TOKEN_CLAIMS" | jq -r '.iss')
+export CLIENT_ID=$(echo "$TOKEN_CLAIMS" | jq -r '.aud | if type == "array" then .[0] else . end')
+
+export IDENTITY_TOKEN="$IDENTITY_TOKEN_FILE"
+
+echo "IDENTITY_TOKEN_FILE=$IDENTITY_TOKEN_FILE"
+echo "IDENTITY_TOKEN=$IDENTITY_TOKEN"
+echo "SERVICE_ACCOUNT=$SERVICE_ACCOUNT"
+echo "OIDC_ISSUER=$OIDC_ISSUER"
+echo "CLIENT_ID=$CLIENT_ID"
+echo "Token content: $(cat "$IDENTITY_TOKEN_FILE" | head -c 50)..."
+
+export FULCIO_URL=https://$(oc get route -n "$TAS_NAMESPACE" -o json | jq -r '.items[] | select(.spec.to.name=="fulcio-server") | .spec.host' | head -1)
+export REKOR_URL=https://$(oc get route -n "$TAS_NAMESPACE" -o json | jq -r '.items[] | select(.spec.to.name=="rekor-server") | .spec.host' | head -1)
+export TUF_URL=https://$(oc get route -n "$TAS_NAMESPACE" -o json | jq -r '.items[] | select(.spec.to.name=="tuf") | .spec.host' | head -1)
+export TSA_URL=https://$(oc get route -n "$TAS_NAMESPACE" -o json | jq -r '.items[] | select(.spec.to.name=="tsa-server") | .spec.host' | head -1)
+export CLI_SERVER_URL=https://$(oc get route -n "$TAS_NAMESPACE" -o json | jq -r '.items[] | select(.spec.to.name=="cli-server") | .spec.host' | head -1)
+
+export ROOT_URL="$TUF_URL/root.json"
+
+# export ROOT_CHECKSUM=$(curl -sS "$TUF_URL/root.json" | sha256sum | cut -d' ' -f1)
+
+# printenv FULCIO_URL REKOR_URL TUF_URL TSA_URL CLI_SERVER_URL OIDC_ISSUER ROOT_CHECKSUM
+
+echo initializing
+uv run python3 model-sign initialize

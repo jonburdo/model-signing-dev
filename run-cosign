@@ -1,0 +1,44 @@
+#!/bin/bash
+set -euo pipefail
+
+NAMESPACE=project2
+SERVICE_ACCOUNT=default
+
+export IDENTITY_TOKEN=$(oc create token default -n "$NAMESPACE" --duration=8h)
+
+export FULCIO_URL=https://$(oc get route -n trusted-artifact-signer -o json | jq -r '.items[] | select(.spec.to.name=="fulcio-server") | .spec.host' | head -1)
+export REKOR_URL=https://$(oc get route -n trusted-artifact-signer -o json | jq -r '.items[] | select(.spec.to.name=="rekor-server") | .spec.host' | head -1)
+export TUF_URL=https://$(oc get route -n trusted-artifact-signer -o json | jq -r '.items[] | select(.spec.to.name=="tuf") | .spec.host' | head -1)
+export TSA_URL=https://$(oc get route -n trusted-artifact-signer -o json | jq -r '.items[] | select(.spec.to.name=="tsa-server") | .spec.host' | head -1)
+export CLI_SERVER_URL=https://$(oc get route -n trusted-artifact-signer -o json | jq -r '.items[] | select(.spec.to.name=="cli-server") | .spec.host' | head -1)
+export OIDC_ISSUER=$(oc whoami --show-server | xargs -I {} sh -c 'curl -sS -H "Authorization: Bearer $(oc whoami -t)" {}/.well-known/openid-configuration' | jq -r '.issuer' 2>/dev/null)
+
+export ROOT_CHECKSUM=$(curl -sS "$TUF_URL/root.json" | sha256sum | cut -d' ' -f1)
+
+printenv FULCIO_URL REKOR_URL TUF_URL TSA_URL CLI_SERVER_URL OIDC_ISSUER ROOT_CHECKSUM
+
+CERTIFICATE_IDENTITY="https://kubernetes.io/namespaces/$NAMESPACE/serviceaccounts/$SERVICE_ACCOUNT"
+
+rm -rf ~/.sigstore/
+
+# initialize a new sigstore config
+cosign initialize --mirror="$TUF_URL" --root="$TUF_URL/root.json" --root-checksum="$ROOT_CHECKSUM"
+
+DIGEST=$(skopeo inspect docker://quay.io/jburdo/hello:v1 | jq -r '.Digest')
+IMAGE=quay.io/jburdo/hello@${DIGEST}
+
+echo signing
+cosign sign -y \
+  --identity-token="$IDENTITY_TOKEN" \
+  --oidc-client-id="$OIDC_ISSUER" \
+  --fulcio-url="$FULCIO_URL" \
+  --rekor-url="$REKOR_URL" \
+	"$IMAGE"
+
+echo verifying
+cosign verify \
+  --certificate-identity="$CERTIFICATE_IDENTITY" \
+  --certificate-oidc-issuer="$OIDC_ISSUER" \
+	"$IMAGE" | jq
+
+echo 'Done!'

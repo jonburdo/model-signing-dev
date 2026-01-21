@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+import sys
+import json
+from pathlib import Path
+
+# Add utils to path
+sys.path.insert(0, str(Path(__file__).parent))
+from utils.signing_utils import get_ignore_paths
+
+
+def main():
+    if len(sys.argv) > 1:
+        # Read from file argument
+        sig_file = Path(sys.argv[1])
+        ignore_paths = get_ignore_paths(sig_file)
+    else:
+        # Read from stdin (for compatibility with original pipe usage)
+        sig_data = json.load(sys.stdin)
+        # Write to temp file for parsing
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sig', delete=False) as f:
+            json.dump(sig_data, f)
+            temp_path = Path(f.name)
+
+        try:
+            ignore_paths = get_ignore_paths(temp_path)
+        finally:
+            temp_path.unlink()
+
+    # Output as JSON array (matching original behavior)
+    print(json.dumps(ignore_paths, indent=2))
+
+
+if __name__ == "__main__":
+    main()

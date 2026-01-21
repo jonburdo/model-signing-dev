@@ -1,0 +1,32 @@
+#!/bin/bash
+set -eu
+
+# Works with this PR/commit:
+#   https://github.com/securesign/model-transparency/pull/35/changes/4e6f879b50b074a1bfc983b10c87441ff817943e
+# direct commit link:
+#   https://github.com/securesign/model-transparency/commit/4e6f879b50b074a1bfc983b10c87441ff817943e
+
+SERVER=$(oc whoami --show-server)
+TOKEN=$(oc whoami -t)
+
+NAMESPACE=project2
+
+OIDC_ISSUER=$(curl -sS -H "Authorization: Bearer $TOKEN" "$SERVER/.well-known/openid-configuration" | jq -r '.issuer')
+IDENTITY_TOKEN=$(oc create token default -n "$NAMESPACE" --duration=8h --audience="$OIDC_ISSUER")
+
+TRUST_CONFIG=~/.local/share/model-registry/signing/https%3A%2F%2Ftuf-trusted-artifact-signer.apps.rosa.jburdo-rosa-12.h9lx.p3.openshiftapps.com/trust_config.json
+MODEL_DIR=~/signing/bert/bert-base-uncased
+
+rm -f "$MODEL_DIR"/model.sig
+
+model_signing sign sigstore "$MODEL_DIR" \
+    --signature "$MODEL_DIR"/model.sig \
+    --trust-config "$TRUST_CONFIG" \
+    --identity-token "$IDENTITY_TOKEN" \
+    --client-id "$OIDC_ISSUER"
+
+model_signing verify sigstore "$MODEL_DIR" \
+    --signature "$MODEL_DIR"/model.sig \
+    --trust-config "$TRUST_CONFIG" \
+    --identity "https://kubernetes.io/namespaces/$NAMESPACE/serviceaccounts/default" \
+    --identity-provider "$OIDC_ISSUER"

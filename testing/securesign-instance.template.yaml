@@ -1,0 +1,67 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: securesign-template
+  annotations:
+    description: "Securesign instance with dynamic OIDC issuer configuration"
+    tags: "securesign,rhtas,signing"
+parameters:
+  - name: OIDC_ISSUER
+    description: "OIDC Issuer URL from cluster"
+    required: true
+  - name: EXTERNAL_ACCESS
+    description: "Enable external access for all services"
+    value: "true"
+  - name: NAMESPACE
+    description: "Namespace for Securesign instance"
+    value: "trusted-artifact-signer"
+  - name: ORGANIZATION_NAME
+    description: "Organization name for certificates"
+    value: "RHOAI"
+  - name: ORGANIZATION_EMAIL
+    description: "Organization email for certificates"
+    value: "admin@example.com"
+objects:
+  - apiVersion: rhtas.redhat.com/v1alpha1
+    kind: Securesign
+    metadata:
+      name: securesign-sample
+      namespace: ${NAMESPACE}
+    spec:
+      fulcio:
+        enabled: true
+        externalAccess:
+          enabled: ${EXTERNAL_ACCESS}
+        certificate:
+          organizationName: ${ORGANIZATION_NAME}
+          organizationEmail: ${ORGANIZATION_EMAIL}
+        config:
+          MetaIssuers:
+            - ClientID: '${OIDC_ISSUER}'
+              Issuer: '${OIDC_ISSUER}'
+              Type: kubernetes
+      rekor:
+        enabled: true
+        externalAccess:
+          enabled: ${EXTERNAL_ACCESS}
+      ctlog:
+        enabled: true
+      tuf:
+        enabled: true
+        externalAccess:
+          enabled: ${EXTERNAL_ACCESS}
+      tsa:
+        enabled: true
+        externalAccess:
+          enabled: ${EXTERNAL_ACCESS}
+        signer:
+          certificateChain:
+            rootCA:
+              organizationName: ${ORGANIZATION_NAME}
+              organizationEmail: ${ORGANIZATION_EMAIL}
+            intermediateCA:
+              - organizationName: ${ORGANIZATION_NAME}
+                organizationEmail: ${ORGANIZATION_EMAIL}
+            leafCA:
+              organizationName: ${ORGANIZATION_NAME}
+              organizationEmail: ${ORGANIZATION_EMAIL}

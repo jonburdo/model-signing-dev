@@ -1,0 +1,33 @@
+#!/bin/bash
+set -eu
+
+# Works with this commit:
+#   https://github.com/securesign/model-transparency/commit/c2b6978f6e0a881196b1cc654d7e0668080b0429
+# which slightly modifies this PR/commit:
+#   https://github.com/securesign/model-transparency/pull/35/changes/4e6f879b50b074a1bfc983b10c87441ff817943e
+# in order to use separate oras clients for push/pull
+
+SERVER=${SERVER:-$(oc whoami --show-server)}
+TOKEN=${TOKEN:-$(oc whoami -t)}
+
+NAMESPACE=project2
+
+OIDC_ISSUER=$(curl -sS -H "Authorization: Bearer $TOKEN" "$SERVER/.well-known/openid-configuration" | jq -r '.issuer')
+IDENTITY_TOKEN=$(oc create token default -n "$NAMESPACE" --duration=8h --audience="$OIDC_ISSUER")
+
+TRUST_CONFIG=~/.local/share/model-registry/signing/https%3A%2F%2Ftuf-trusted-artifact-signer.apps.rosa.jburdo-rosa-12.h9lx.p3.openshiftapps.com/trust_config.json
+MODEL_DIR=~/signing/bert/bert-base-uncased
+
+#DIGEST=$(skopeo inspect docker://quay.io/jburdo/hello:v1 | jq -r '.Digest')
+#IMAGE=quay.io/jburdo/hello@${DIGEST}
+IMAGE=quay.io/jburdo/hello@sha256:43de9874507eaa8ffd88eac885b672b1dfc57cc583d9ad920850f97f19809f8f
+
+uv run model_signing sign sigstore "$IMAGE" \
+    --trust-config "$TRUST_CONFIG" \
+    --identity-token "$IDENTITY_TOKEN" \
+    --client-id "$OIDC_ISSUER"
+
+uv run model_signing verify sigstore "$IMAGE" \
+    --trust-config "$TRUST_CONFIG" \
+    --identity "https://kubernetes.io/namespaces/$NAMESPACE/serviceaccounts/default" \
+    --identity-provider "$OIDC_ISSUER"

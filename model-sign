@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""
+Model signing CLI tool for private TAS infrastructure.
+
+A single-file CLI tool that handles ML model signing and verification
+with private Trusted Artifact Signer (TAS) infrastructure.
+
+Commands:
+  initialize  Download and cache trust configuration from TAS
+  sign        Sign a model directory
+  verify      Verify a signed model
+
+Usage:
+  model-sign initialize --tuf-url=$TUF_URL
+  model-sign sign MODEL_PATH
+  model-sign verify MODEL_PATH
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import urllib.error
+import urllib.parse
+from pathlib import Path
+
+
+from model_registry.signing import ModelSigner
+from model_registry.signing.exceptions import (
+    InitializationError,
+    SigningError,
+    VerificationError,
+)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+def get_signer_config():
+    """
+    Get ModelSigner configuration from environment variables.
+
+    This ensures all commands use the same configuration for consistent initialization.
+
+    Returns:
+        dict: Configuration parameters for ModelSigner
+    """
+    return {
+        "tuf_url": os.getenv("TUF_URL"),
+        "fulcio_url": os.getenv("FULCIO_URL"),
+        "rekor_url": os.getenv("REKOR_URL"),
+        "tsa_url": os.getenv("TSA_URL"),
+        "oidc_issuer": os.getenv("OIDC_ISSUER"),
+        "root": os.getenv("ROOT_URL"),
+        "root_checksum": os.getenv("ROOT_CHECKSUM"),
+    }
+
+
+def cmd_initialize(args):
+    """Initialize trust configuration from TAS."""
+    logger.info("=" * 70)
+    logger.info("Initializing Model Signing Trust Configuration")
+    logger.info("=" * 70)
+
+    # Get required environment variables
+    required_vars = ["FULCIO_URL", "REKOR_URL", "TUF_URL", "OIDC_ISSUER"]
+    missing = [v for v in required_vars if not os.getenv(v)]
+
+    if missing:
+        logger.error(f"Error: Missing environment variables: {', '.join(missing)}")
+        logger.info("Required environment variables:")
+        for var in required_vars:
+            logger.info(f"  - {var}")
+        logger.info("Optional:")
+        logger.info("  - TSA_URL")
+        logger.info("  - ROOT_URL (explicit root.json URL)")
+        logger.info("  - ROOT_CHECKSUM (SHA256 of root.json)")
+        return 1
+
+    # Get signer configuration from environment
+    config = get_signer_config()
+
+    logger.info(f"TUF URL: {config['tuf_url']}")
+    logger.info(f"Fulcio URL: {config['fulcio_url']}")
+    logger.info(f"Rekor URL: {config['rekor_url']}")
+    if config["tsa_url"]:
+        logger.info(f"TSA URL: {config['tsa_url']}")
+    if config["root"]:
+        logger.info(f"Root URL: {config['root']}")
+        if config["root_checksum"]:
+            logger.info(f"Root Checksum: {config['root_checksum']}")
+
+    try:
+        # Create ModelSigner instance with consistent configuration
+        signer = ModelSigner(**config)
+
+        # Initialize (download and cache trust config)
+        signer.initialize(force=True)
+
+        logger.info("Initialization complete!")
+        logger.info("You can now run:")
+        logger.info("  model-sign sign MODEL_PATH")
+        logger.info("  model-sign verify MODEL_PATH")
+        return 0
+
+    except InitializationError as e:
+        logger.error(f"Initialization failed: {e}")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return 1
+
+
+def cmd_sign(args):
+    """Sign a model directory."""
+    logger.info("=" * 70)
+    logger.info("Model Signing")
+    logger.info("=" * 70)
+
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        logger.error(f"Error: Model path not found: {model_path}")
+        return 1
+
+    if not model_path.is_dir():
+        logger.error(f"Error: Model path must be a directory: {model_path}")
+        return 1
+
+    # Get base signer configuration
+    config = get_signer_config()
+
+    # Add sign-specific parameters
+    identity_token_env = os.getenv("IDENTITY_TOKEN")
+    client_id = os.getenv("CLIENT_ID")
+
+    if not config["oidc_issuer"]:
+        logger.error("Error: OIDC_ISSUER not set")
+        return 1
+
+    config["identity_token_path"] = identity_token_env
+
+    logger.info(f"Model path: {model_path}")
+
+    try:
+        # Create ModelSigner instance with consistent configuration
+        signer = ModelSigner(**config)
+
+        # Sign (client_id will be extracted from token if not provided)
+        signature_path = signer.sign(
+            model_path,
+            signature_path=args.signature_path,
+            client_id=client_id,
+            ignore_paths=[".cache"]
+        )
+        logger.info("Success!")
+        logger.info(f"   Model: {model_path}")
+        logger.info(f"   Signature: {signature_path}")
+        return 0
+
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        return 1
+    except SigningError as e:
+        logger.error(f"Signing failed: {e}")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return 1
+
+
+def cmd_verify(args):
+    """Verify a signed model."""
+    logger.info("=" * 70)
+    logger.info("Model Verification")
+    logger.info("=" * 70)
+
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        logger.error(f"Error: Model path not found: {model_path}")
+        return 1
+
+    # Get base signer configuration
+    config = get_signer_config()
+
+    # Add verify-specific parameters
+    certificate_identity = os.getenv("EXPECTED_IDENTITY")
+
+    if not config["oidc_issuer"]:
+        logger.error("Error: OIDC_ISSUER not set")
+        return 1
+
+    config["certificate_identity"] = certificate_identity
+
+    logger.info(f"Model path: {model_path}")
+
+    try:
+        # Create ModelSigner instance with consistent configuration
+        signer = ModelSigner(**config)
+
+        # Verify
+        success = signer.verify(
+            model_path,
+            signature_path=args.signature_path,
+        )
+        return 0 if success else 1
+
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        return 1
+    except VerificationError as e:
+        logger.error(f"Verification failed: {e}")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return 1
+
+
+def cmd_status(args):
+    """Show initialization status."""
+    logger.info("=" * 70)
+    logger.info("Model Signing Status")
+    logger.info("=" * 70)
+
+    # Create a trust manager to check cache
+    signer = ModelSigner()
+    cache_dir = signer.trust_manager.base_cache_dir
+
+    logger.info(f"Cache directory: {cache_dir}")
+
+    # Check all TUF URLs in the cache directory
+    if not cache_dir.exists():
+        logger.warning("Not initialized")
+        logger.info("Run: model-sign initialize")
+        return 0
+
+    # Find all TUF URL directories in cache
+    tuf_dirs = [d for d in cache_dir.iterdir() if d.is_dir()]
+    if not tuf_dirs:
+        logger.warning("Not initialized")
+        logger.info("Run: model-sign initialize")
+        return 0
+
+    # For each TUF URL found, show status
+    for tuf_dir in sorted(tuf_dirs):
+        # Decode the URL-encoded directory name
+
+        tuf_url = urllib.parse.unquote(tuf_dir.name)
+
+        trust_root_path = tuf_dir / "root" / "targets" / "trusted_root.json"
+        trust_config_path = tuf_dir / "trust_config.json"
+
+        logger.info(f"TUF URL: {tuf_url}")
+        logger.info(f"  Trusted root: {trust_root_path}")
+        logger.info(f"  Trust config: {trust_config_path}")
+
+        if trust_config_path.exists() and trust_root_path.exists():
+            logger.info("  Initialized")
+
+            try:
+                trust_config = json.loads(trust_config_path.read_text())
+                trusted_root = trust_config.get("trustedRoot", {})
+                signing_config = trust_config.get("signingConfig", {})
+
+                logger.info("  Trust configuration:")
+                logger.info(f"    Media type: {trust_config.get('mediaType')}")
+                logger.info("  Trusted root:")
+                logger.info(
+                    f"    Certificate Authorities: {len(trusted_root.get('certificateAuthorities', []))}"
+                )
+                logger.info(
+                    f"    Transparency Logs: {len(trusted_root.get('tlogs', []))}"
+                )
+                logger.info(
+                    f"    Timestamp Authorities: {len(trusted_root.get('timestampAuthorities', []))}"
+                )
+
+                logger.info("  Service URLs:")
+                for ca_url in signing_config.get("caUrls", []):
+                    logger.info(f"    Fulcio: {ca_url.get('url')}")
+                for rekor_url in signing_config.get("rekorTlogUrls", []):
+                    logger.info(f"    Rekor: {rekor_url.get('url')}")
+                for tsa_url in signing_config.get("tsaUrls", []):
+                    logger.info(f"    TSA: {tsa_url.get('url')}")
+                for oidc_url in signing_config.get("oidcUrls", []):
+                    logger.info(f"    OIDC: {oidc_url.get('url')}")
+
+            except Exception as e:
+                logger.warning(f"    Warning: Could not parse config: {e}")
+        else:
+            logger.warning("  Not fully initialized")
+
+    return 0
+
+
+# =============================================================================
+# Main CLI
+# =============================================================================
+
+
+def main():
+    # Configure logging for CLI usage
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Model signing CLI for private TAS infrastructure",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Initialize (download and cache trust config)
+  # First time with new TUF instance - requires root.json bootstrap
+  export FULCIO_URL=https://fulcio-server-...
+  export REKOR_URL=https://rekor-server-...
+  export TUF_URL=https://tuf-...
+  export TSA_URL=https://tsa-server-...
+  export OIDC_ISSUER=https://rh-oidc.s3...
+  model-sign initialize --root-json /path/to/root.json
+
+  # Subsequent initializations (uses cached TUF metadata, auto-refreshes)
+  model-sign initialize
+
+  # Sign a model
+  export IDENTITY_TOKEN=$(oc create token default -n trusted-artifact-signer)
+  model-sign sign bert-base-uncased/
+
+  # Verify a model
+  model-sign verify bert-base-uncased/
+
+  # Check status
+  model-sign status
+        """,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # Initialize command
+    parser_init = subparsers.add_parser(
+        "initialize",
+        aliases=["init"],
+        help="Download and cache trust configuration from TAS",
+    )
+    parser_init.add_argument(
+        "--root-json",
+        type=str,
+        help="Path to TUF root.json for first-time initialization (required for new TUF instances)",
+    )
+
+    # Sign command
+    parser_sign = subparsers.add_parser("sign", help="Sign a model directory")
+    parser_sign.add_argument("model_path", help="Path to model directory to sign")
+    parser_sign.add_argument(
+        "--signature-path",
+        type=str,
+        help="Path where signature file should be written (default: MODEL_PATH/model.sig)",
+        default=None,
+    )
+
+    # Verify command
+    parser_verify = subparsers.add_parser("verify", help="Verify a signed model")
+    parser_verify.add_argument("model_path", help="Path to signed model directory")
+    parser_verify.add_argument(
+        "--signature-path",
+        type=str,
+        help="Path to signature file (default: MODEL_PATH/model.sig)",
+        default=None,
+    )
+    parser_verify.add_argument(
+        "--identity",
+        help="Expected identity (default: system:serviceaccount:trusted-artifact-signer:default)",
+        default=None,
+    )
+
+    # Status command
+    subparsers.add_parser("status", help="Show initialization status")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    # Route to command handlers
+    if args.command in ["initialize", "init"]:
+        return cmd_initialize(args)
+    elif args.command == "sign":
+        return cmd_sign(args)
+    elif args.command == "verify":
+        return cmd_verify(args)
+    elif args.command == "status":
+        return cmd_status(args)
+    else:
+        parser.print_help()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

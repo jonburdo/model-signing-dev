@@ -1,0 +1,19 @@
+#!/bin/bash
+set -eu
+
+# Source environment setup
+source ./setup-env.sh
+
+# Remove existing signature
+rm -f "$MODEL_DIR"/model.sig
+
+# Sign the model
+echo signing
+uv run python3 model-sign sign "$MODEL_DIR"
+
+# Verify the model
+echo verify
+uv run python3 model-sign verify "$MODEL_DIR"
+
+echo 'showing path ignores'
+cat "$MODEL_DIR/model.sig" | ./get-sig-ignores

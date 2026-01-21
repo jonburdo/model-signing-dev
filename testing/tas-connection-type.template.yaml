@@ -1,0 +1,105 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: tas-connection-type-template
+  annotations:
+    description: "ODH Connection Type for Red Hat Trusted Artifact Signer with external routes"
+parameters:
+  - name: FULCIO_URL
+    description: "Fulcio external route URL"
+    required: true
+  - name: REKOR_URL
+    description: "Rekor external route URL"
+    required: true
+  - name: TSA_URL
+    description: "TSA external route URL"
+    required: true
+  - name: TUF_URL
+    description: "TUF external route URL"
+    required: true
+  - name: CLI_SERVER_URL
+    description: "CLI server external route URL"
+    required: true
+  - name: OIDC_ISSUER
+    description: "OIDC Issuer URL"
+    required: true
+objects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: tas-securesign-v1
+      namespace: opendatahub
+      labels:
+        opendatahub.io/connection-type: "true"
+        opendatahub.io/dashboard: "true"
+        app.opendatahub.io/dashboard: "true"
+        app: odh-dashboard
+        app.kubernetes.io/part-of: dashboard
+      annotations:
+        openshift.io/display-name: "Red Hat Trusted Artifact Signer"
+        openshift.io/description: "Connect to Red Hat Trusted Artifact Signer (RHTAS) for keyless signing and verification of AI artifacts. This connection provides access to Sigstore services including Fulcio (certificate authority), Rekor (transparency log), TSA (timestamp authority), and TUF (trust root distribution)."
+    data:
+      category: '["Artifact signing"]'
+      fields: |
+        [
+          {
+            "type": "short-text",
+            "name": "Fulcio URL",
+            "description": "Fulcio certificate authority service URL for keyless signing.",
+            "envVar": "FULCIO_URL",
+            "properties": {
+              "defaultValue": "${FULCIO_URL}"
+            },
+            "required": true
+          },
+          {
+            "type": "short-text",
+            "name": "Rekor URL",
+            "description": "Rekor transparency log service URL for signature verification.",
+            "envVar": "REKOR_URL",
+            "properties": {
+              "defaultValue": "${REKOR_URL}"
+            },
+            "required": true
+          },
+          {
+            "type": "short-text",
+            "name": "TSA URL",
+            "description": "Timestamp Authority service URL for trusted timestamps (RFC 3161).",
+            "envVar": "TSA_URL",
+            "properties": {
+              "defaultValue": "${TSA_URL}"
+            },
+            "required": false
+          },
+          {
+            "type": "short-text",
+            "name": "TUF URL",
+            "description": "The Update Framework (TUF) service URL for trust root distribution.",
+            "envVar": "TUF_URL",
+            "properties": {
+              "defaultValue": "${TUF_URL}"
+            },
+            "required": true
+          },
+          {
+            "type": "short-text",
+            "name": "Cosign Binary Server URL",
+            "description": "TAS CLI server URL for downloading the TAS-specific cosign binary.",
+            "envVar": "TAS_COSIGN_CLI_URL",
+            "properties": {
+              "defaultValue": "${CLI_SERVER_URL}"
+            },
+            "required": true
+          },
+          {
+            "type": "short-text",
+            "name": "OIDC Issuer",
+            "description": "OIDC issuer URL configured in the Securesign instance for keyless signing authentication.",
+            "envVar": "OIDC_ISSUER_URL",
+            "properties": {
+              "defaultValue": "${OIDC_ISSUER}"
+            },
+            "required": false
+          }
+        ]
