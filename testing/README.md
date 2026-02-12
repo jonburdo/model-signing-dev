@@ -48,18 +48,21 @@ oc apply -f tas-connection-type.yaml
 ### Set OIDC Issuer
 
 ```bash
-# Option 1: Fetch from cluster (automatic in script)
 APISERVER=$(oc whoami --show-server)
 TOKEN=$(oc whoami -t)
-OIDC_ISSUER=$(curl -sS -H "Authorization: Bearer $TOKEN" \
-  "$APISERVER/.well-known/openid-configuration" | jq -r '.issuer')
+OIDC_ISSUER=$(curl -sS -H "Authorization: Bearer $TOKEN" "$APISERVER/.well-known/openid-configuration" | jq -r '.issuer')
 
 echo "OIDC Issuer: $OIDC_ISSUER"
-
-# Option 2: Set manually (skips cluster fetch)
-export OIDC_ISSUER="https://kubernetes.default.svc"
-./configure-securesign.sh
 ```
+Note:
+
+On ROSA clusters, we get something that looks like: `https://rh-oidc.s3.us-east-1.amazonaws.com/14x289st4my8a167xq97d0mi2941klex`
+
+On some clusters you might get an internal route that looks like: `https://kubernetes.default.svc`
+This internal route may work (not confirmed) if the securesign instance is also on the cluster.
+
+> Starting with Kubernetes 1.20+, the API server also acts as an OIDC provider:
+> https://kubernetes.default.svc/.well-known/openid-configuration
 
 ### Process Template
 
