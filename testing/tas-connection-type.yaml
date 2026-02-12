@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tas-securesign-v1
+  namespace: opendatahub
+  labels:
+    app: odh-dashboard
+    app.kubernetes.io/part-of: dashboard
+    app.opendatahub.io/dashboard: "true"
+    opendatahub.io/connection-type: "true"
+    opendatahub.io/dashboard: "true"
+  annotations:
+    openshift.io/display-name: Red Hat Trusted Artifact Signer
+    openshift.io/description: Connect to Red Hat Trusted Artifact Signer (RHTAS) for keyless signing and verification of AI artifacts. This connection provides access to Sigstore services including Fulcio (certificate authority), Rekor (transparency log), TSA (timestamp authority), and TUF (trust root distribution).
+data:
+  category: '["Artifact signing"]'
+  fields: |
+    [
+      {
+        "type": "short-text",
+        "name": "TUF URL",
+        "description": "The Update Framework (TUF) service URL for trust root distribution.",
+        "envVar": "SIGSTORE_TUF_URL",
+        "properties": {},
+        "required": true
+      },
+      {
+        "type": "short-text",
+        "name": "Fulcio URL",
+        "description": "Fulcio certificate authority service URL for keyless signing.",
+        "envVar": "SIGSTORE_FULCIO_URL",
+        "properties": {},
+        "required": true
+      },
+      {
+        "type": "short-text",
+        "name": "Rekor URL",
+        "description": "Rekor transparency log service URL for signature verification.",
+        "envVar": "SIGSTORE_REKOR_URL",
+        "properties": {},
+        "required": true
+      },
+      {
+        "type": "short-text",
+        "name": "TSA URL",
+        "description": "Timestamp Authority service URL for trusted timestamps (RFC 3161).",
+        "envVar": "SIGSTORE_TSA_URL",
+        "properties": {},
+        "required": false
+      }
+    ]

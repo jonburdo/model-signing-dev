@@ -33,13 +33,9 @@ oc apply -f securesign-instance.yaml
 oc get securesign -n trusted-artifact-signer -w
 ```
 
-### 2. Generate and Deploy ODH Connection Type
+### 2. Create Custom Connection Type
 
 ```bash
-# After Securesign is ready, generate connection type
-./configure-connection-type.sh
-
-# Apply to opendatahub namespace
 oc apply -f tas-connection-type.yaml
 ```
 
