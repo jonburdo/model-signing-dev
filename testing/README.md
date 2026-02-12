@@ -29,7 +29,7 @@ oc get csv -n openshift-operators | grep rhtas
 # Apply to cluster
 oc apply -f securesign-instance.yaml
 
-# Wait for it to be ready (5-10 minutes)
+# Wait for it to be ready
 oc get securesign -n trusted-artifact-signer -w
 ```
 
