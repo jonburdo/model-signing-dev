@@ -1,0 +1,47 @@
+apiVersion: v1
+items:
+- apiVersion: rhtas.redhat.com/v1alpha1
+  kind: Securesign
+  metadata:
+    name: securesign-sample
+    namespace: trusted-artifact-signer
+  spec:
+    ctlog:
+      enabled: true
+    fulcio:
+      certificate:
+        organizationEmail: admin@example.com
+        organizationName: RHOAI
+      config:
+        MetaIssuers:
+        - ClientID: https://rh-oidc.s3.us-east-1.amazonaws.com/23c734st3pn7l167mq97d0ot8848lgrl
+          Issuer: https://rh-oidc.s3.us-east-1.amazonaws.com/23c734st3pn7l167mq97d0ot8848lgrl
+          Type: kubernetes
+      enabled: true
+      externalAccess:
+        enabled: "true"
+    rekor:
+      enabled: true
+      externalAccess:
+        enabled: "true"
+    tsa:
+      enabled: true
+      externalAccess:
+        enabled: "true"
+      signer:
+        certificateChain:
+          intermediateCA:
+          - organizationEmail: admin@example.com
+            organizationName: RHOAI
+          leafCA:
+            organizationEmail: admin@example.com
+            organizationName: RHOAI
+          rootCA:
+            organizationEmail: admin@example.com
+            organizationName: RHOAI
+    tuf:
+      enabled: true
+      externalAccess:
+        enabled: "true"
+kind: List
+metadata: {}
